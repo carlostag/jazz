@@ -2,8 +2,6 @@ import io, random, os
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from mido import Message, MidiFile, MidiTrack, MetaMessage, bpm2tempo
-
-# music21 para partitura completa (MusicXML / PDF si disponible)
 from music21 import stream as m21stream, note as m21note, chord as m21chord
 from music21 import instrument as m21inst, meter as m21meter, tempo as m21tempo
 from music21 import key as m21key, duration as m21duration, metadata as m21metadata
@@ -16,8 +14,6 @@ st.title("🎷 Generador de Combo de Jazz (MIDI + Partitura completa)")
 
 TICKS_PER_BEAT = 480
 BEATS_PER_BAR = 4
-BARS = 8
-TOTAL_BEATS = BEATS_PER_BAR * BARS
 
 KEY_OPTIONS = {
     "Do mayor (C major)": {
@@ -35,8 +31,8 @@ KEY_OPTIONS = {
 }
 
 INSTRUMENTS = {
-    "Vibráfono": 11,  # GM
-    "Trompeta": 56,   # GM
+    "Vibráfono": 11,
+    "Trompeta": 56,
 }
 
 # Escalas diatónicas
@@ -61,30 +57,48 @@ def clamp_to_range(midi, lo=60, hi=84):
         midi -= 12
     return midi
 
-def build_progression(root_midi, mode):
-    if mode == "major":
-        four = [
-            [root_midi, root_midi+4, root_midi+7, root_midi+11],       # Cmaj7
-            [root_midi+9, root_midi+12, root_midi+16, root_midi+19],   # Am7
-            [root_midi+2, root_midi+5, root_midi+9, root_midi+12],     # Dm7
-            [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # G7
+# =========================
+# PROGRESIONES
+# =========================
+def build_progression(root_midi, mode, progression_type="I-vi-ii-V"):
+    if progression_type == "I-vi-ii-V":
+        bars = 8
+        if mode == "major":
+            four = [
+                [root_midi, root_midi+4, root_midi+7, root_midi+11],       # Cmaj7
+                [root_midi+9, root_midi+12, root_midi+16, root_midi+19],   # Am7
+                [root_midi+2, root_midi+5, root_midi+9, root_midi+12],     # Dm7
+                [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # G7
+            ]
+        else:
+            four = [
+                [root_midi, root_midi+3, root_midi+7, root_midi+10],       # Am7
+                [root_midi+8, root_midi+12, root_midi+15, root_midi+19],   # Fmaj7
+                [root_midi+2, root_midi+5, root_midi+10, root_midi+14],    # Bm7b5
+                [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # E7
+            ]
+        return four * 2, bars
+
+    elif progression_type == "Blues en C":
+        bars = 12
+        I7  = [root_midi, root_midi+4, root_midi+7, root_midi+10]
+        IV7 = [root_midi+5, root_midi+9, root_midi+12, root_midi+15]
+        V7  = [root_midi+7, root_midi+11, root_midi+14, root_midi+17]
+        prog = [
+            I7, I7, I7, I7,
+            IV7, IV7, I7, I7,
+            V7, IV7, I7, V7
         ]
-    else:
-        four = [
-            [root_midi, root_midi+3, root_midi+7, root_midi+10],       # Am7
-            [root_midi+8, root_midi+12, root_midi+15, root_midi+19],   # Fmaj7
-            [root_midi+2, root_midi+5, root_midi+10, root_midi+14],    # Bm7b5
-            [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # E7
-        ]
-    return four * 2
+        return prog, bars
 
 # =========================
 # GENERADORES
 # =========================
-def melody(root_midi, mode, seed):
+def melody(root_midi, mode, seed, total_bars):
     random.seed(seed)
     deg = 7
     events = []
+    TOTAL_BEATS = total_bars * BEATS_PER_BAR
     t = 0.0
     while t < TOTAL_BEATS:
         dur = random.choice([0.5, 1.0])
@@ -100,8 +114,7 @@ def melody(root_midi, mode, seed):
 
 def walking_bass(prog):
     events = []
-    for bar in range(BARS):
-        chord = prog[bar]
+    for bar, chord in enumerate(prog):
         root = chord[0] - 24
         for beat in range(BEATS_PER_BAR):
             t = bar*BEATS_PER_BAR + beat
@@ -110,17 +123,16 @@ def walking_bass(prog):
 
 def chord_hits(prog):
     events = []
-    for bar in range(BARS):
-        chord = prog[bar]
+    for bar, chord in enumerate(prog):
         for beat in [0, 2]:
             t = bar*BEATS_PER_BAR + beat
             for n in chord:
                 events.append((t, 2.0, n))
     return events
 
-def swing_drums():
+def swing_drums(total_bars):
     events = []
-    for bar in range(BARS):
+    for bar in range(total_bars):
         for beat in range(BEATS_PER_BAR):
             t = bar*BEATS_PER_BAR + beat
             if beat in [0,1,2,3]:
@@ -173,98 +185,7 @@ def events_to_midi(melody_ev, bass_ev, chord_ev, drum_ev, bpm, instr_melody):
     return mid
 
 # =========================
-# PARTITURA MUSIC21
-# =========================
-def build_full_score_music21(prog, melody_ev, bpm, tonic, mode):
-    sc = m21stream.Score()
-    sc.insert(0, m21metadata.Metadata())
-    sc.metadata.title = "Combo Jazz – I–vi–ii–V"
-    sc.metadata.composer = "Generador Streamlit"
-
-    ts = m21meter.TimeSignature("4/4")
-    mm = m21tempo.MetronomeMark(number=bpm)
-    k = m21key.Key(tonic, mode)
-
-    p_mel = m21stream.Part()
-    p_mel.id = "Melody"
-    p_mel.insert(0, m21inst.Vibraphone())
-    p_mel.append(ts)
-    p_mel.append(mm)
-    p_mel.append(k)
-
-    for t, dur, midi in melody_ev:
-        n = m21note.Note(midi)
-        n.duration = m21duration.Duration(dur)
-        p_mel.insert(t, n)
-
-    p_bass = m21stream.Part()
-    p_bass.id = "Bass"
-    p_bass.insert(0, m21inst.Contrabass())
-    p_bass.append(ts)
-    p_bass.append(mm)
-    p_bass.append(k)
-
-    for bar in range(BARS):
-        root = prog[bar][0] - 24
-        for beat in range(BEATS_PER_BAR):
-            t = bar*BEATS_PER_BAR + beat
-            n = m21note.Note(root)
-            n.duration = m21duration.Duration(1.0)
-            p_bass.insert(t, n)
-
-    p_pno = m21stream.Part()
-    p_pno.id = "Piano"
-    p_pno.insert(0, m21inst.Piano())
-    p_pno.append(ts)
-    p_pno.append(mm)
-    p_pno.append(k)
-
-    for bar in range(BARS):
-        chord_pitches = prog[bar]
-        for beat in [0, 2]:
-            t = bar*BEATS_PER_BAR + beat
-            ch = m21chord.Chord(chord_pitches)
-            ch.duration = m21duration.Duration(2.0)
-            p_pno.insert(t, ch)
-
-    sc.insert(0, p_mel)
-    sc.insert(0, p_bass)
-    sc.insert(0, p_pno)
-    return sc
-
-def write_musicxml_bytes(score_obj):
-    from tempfile import NamedTemporaryFile
-    with NamedTemporaryFile(delete=False, suffix=".musicxml") as tmp:
-        fp = tmp.name
-    try:
-        score_obj.write("musicxml", fp=fp)
-        with open(fp, "rb") as f:
-            data = f.read()
-    finally:
-        try:
-            os.remove(fp)
-        except Exception:
-            pass
-    return data
-
-def try_write_pdf_bytes(score_obj):
-    from tempfile import NamedTemporaryFile
-    try:
-        with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            fp = tmp.name
-        score_obj.write("musicxml.pdf", fp=fp)
-        with open(fp, "rb") as f:
-            pdf_data = f.read()
-        try:
-            os.remove(fp)
-        except Exception:
-            pass
-        return pdf_data
-    except Exception:
-        return None
-
-# =========================
-# VISTA PREVIA PNG (MELODÍA)
+# PARTITURA SIMPLIFICADA PNG
 # =========================
 def draw_score_preview(events, key_name, bpm):
     width, height = 1000, 220
@@ -298,34 +219,25 @@ with col2:
 with col3:
     seed = st.number_input("Semilla", 0, 99999, 42)
 
+progression_type = st.radio("Tipo de progresión", ["I-vi-ii-V", "Blues en C"])
 mel_instr_name = st.radio("Instrumento de la melodía (MIDI)", list(INSTRUMENTS.keys()), index=0)
 instr_melody = INSTRUMENTS[mel_instr_name]
 
-if st.button("🎶 Generar combo de jazz (MIDI + Partitura completa)"):
+if st.button("🎶 Generar combo de jazz (MIDI + Partitura simplificada)"):
     cfg = KEY_OPTIONS[key_name]
-    prog = build_progression(cfg["root_midi"], cfg["mode"])
-    mel = melody(cfg["root_midi"], cfg["mode"], seed)
+    prog, total_bars = build_progression(cfg["root_midi"], cfg["mode"], progression_type)
+    mel = melody(cfg["root_midi"], cfg["mode"], seed, total_bars)
     bass = walking_bass(prog)
     chords_ev = chord_hits(prog)
-    drums = swing_drums()
+    drums = swing_drums(total_bars)
 
     mid = events_to_midi(mel, bass, chords_ev, drums, bpm, instr_melody)
     midi_bytes = io.BytesIO()
     mid.save(file=midi_bytes); midi_bytes.seek(0)
 
-    score = build_full_score_music21(prog, mel, bpm, cfg["tonic"], cfg["scale_mode"])
-    mxl_bytes = write_musicxml_bytes(score)
-    pdf_bytes = try_write_pdf_bytes(score)
-
     preview_img = draw_score_preview(mel, key_name, bpm)
     buf = io.BytesIO(); preview_img.save(buf, format="PNG"); buf.seek(0)
 
-    st.success("¡Listo! 🎷 Partitura completa (MusicXML) + MIDI generado.")
+    st.success(f"¡Listo! 🎷 Combo con progresión {progression_type}.")
     st.image(buf, caption="Vista previa rápida (melodía)")
     st.download_button("⬇️ Descargar MIDI", data=midi_bytes, file_name="combo.mid", mime="audio/midi")
-    st.download_button("⬇️ Descargar MusicXML", data=mxl_bytes, file_name="partitura.musicxml", mime="application/vnd.recordare.musicxml+xml")
-
-    if pdf_bytes:
-        st.download_button("⬇️ Descargar PDF", data=pdf_bytes, file_name="partitura.pdf", mime="application/pdf")
-    else:
-        st.info("En este entorno no hay backend de notación (MuseScore/LilyPond). Abre el MusicXML en MuseScore y expórtalo como PDF.")
