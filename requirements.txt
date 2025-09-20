@@ -3,3 +3,5 @@ numpy
 pillow
 mido
 music21
+moviepy
+scipy
