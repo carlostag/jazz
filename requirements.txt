@@ -3,5 +3,5 @@ numpy
 pillow
 mido
 music21
-moviepy
+moviepy==1.0.3
 scipy
