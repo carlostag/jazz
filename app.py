@@ -19,7 +19,7 @@ BARS = 8
 TOTAL_BEATS = BEATS_PER_BAR * BARS
 
 # Ruta del SoundFont (ajústalo a tu entorno)
-SOUNDFONT_PATH = "soundfonts/FluidR3_GM.sf2"
+SOUNDFONT_PATH = "FluidR3Mono_GM.sf2"
 
 # Escalas diatónicas
 MAJOR_STEPS = [0, 2, 4, 5, 7, 9, 11]
