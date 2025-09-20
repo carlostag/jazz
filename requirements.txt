@@ -2,3 +2,4 @@ streamlit
 numpy
 pillow
 mido
+music21
