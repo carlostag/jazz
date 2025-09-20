@@ -7,16 +7,12 @@ from mido import Message, MidiFile, MidiTrack, MetaMessage, bpm2tempo
 # CONFIG
 # =========================
 st.set_page_config(page_title="Generador Jazz Combo", page_icon="🎷")
-st.title("🎷 Generador de Combo de Jazz (MIDI + Partitura)")
+st.title("🎷 Generador de Combo de Jazz con Progresión I–vi–ii–V")
 
 TICKS_PER_BEAT = 480
 BEATS_PER_BAR = 4
 BARS = 8
 TOTAL_BEATS = BEATS_PER_BAR * BARS
-
-# Escalas diatónicas
-MAJOR_STEPS = [0, 2, 4, 5, 7, 9, 11]
-MINOR_STEPS = [0, 2, 3, 5, 7, 8, 10]
 
 KEY_OPTIONS = {
     "Do mayor (C major)": {"root_midi": 60, "mode": "major"},
@@ -29,8 +25,11 @@ INSTRUMENTS = {
 }
 
 # =========================
-# UTILIDADES MUSICALES
+# ESCALAS Y ACORDES
 # =========================
+MAJOR_STEPS = [0, 2, 4, 5, 7, 9, 11]
+MINOR_STEPS = [0, 2, 3, 5, 7, 8, 10]
+
 def scale_steps(mode):
     return MAJOR_STEPS if mode == "major" else MINOR_STEPS
 
@@ -39,33 +38,30 @@ def degree_to_midi(root_midi, degree, mode):
     diatonic = steps[degree % 7] + 12 * (degree // 7)
     return root_midi + diatonic
 
-def walking_bass(root_midi, mode):
-    notes = []
-    deg = 0
-    for bar in range(BARS):
-        for beat in range(BEATS_PER_BAR):
-            t = bar * BEATS_PER_BAR + beat
-            if beat == 0:
-                deg = 0
-            else:
-                step = random.choice([-2, -1, 1, 2])
-                deg += step
-            midi = degree_to_midi(root_midi - 12, deg, mode)
-            notes.append((t, 1.0, midi))
-    return notes
+def build_progression(root_midi, mode):
+    """Devuelve lista de acordes para cada compás."""
+    if mode == "major":
+        # I – vi – ii – V – I – vi – ii – V
+        return [
+            [root_midi, root_midi+4, root_midi+7, root_midi+11],       # Cmaj7
+            [root_midi+9, root_midi+12, root_midi+16, root_midi+19],   # Am7
+            [root_midi+2, root_midi+5, root_midi+9, root_midi+12],     # Dm7
+            [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # G7
+        ] * 2
+    else:
+        # i – VI – iiø – V7
+        return [
+            [root_midi, root_midi+3, root_midi+7, root_midi+10],       # Am7
+            [root_midi+8, root_midi+12, root_midi+15, root_midi+19],   # Fmaj7
+            [root_midi+2, root_midi+5, root_midi+10, root_midi+14],    # Bm7b5
+            [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # E7
+        ] * 2
 
-def chords(root_midi, mode):
-    chords = []
-    for bar in range(BARS):
-        for beat in [0, 2]:
-            t = bar * BEATS_PER_BAR + beat
-            root = root_midi
-            chord = [root, root+4, root+7, root+11] if mode=="major" else [root, root+3, root+7, root+10]
-            for n in chord:
-                chords.append((t, 2.0, n))
-    return chords
-
+# =========================
+# GENERADORES
+# =========================
 def melody(root_midi, mode, seed):
+    """Melodía diatónica sencilla sobre la escala."""
     random.seed(seed)
     deg = 7
     events = []
@@ -80,15 +76,36 @@ def melody(root_midi, mode, seed):
         t += dur
     return events
 
+def walking_bass(prog):
+    """Contrabajo: negra por pulso siguiendo fundamental del acorde."""
+    events = []
+    for bar in range(BARS):
+        chord = prog[bar]
+        root = chord[0] - 24  # fundamental dos octavas abajo
+        for beat in range(BEATS_PER_BAR):
+            t = bar*BEATS_PER_BAR + beat
+            events.append((t, 1.0, root))
+    return events
+
+def chord_hits(prog):
+    """Acordes en el 1 y 3 de cada compás."""
+    events = []
+    for bar in range(BARS):
+        chord = prog[bar]
+        for beat in [0, 2]:
+            t = bar*BEATS_PER_BAR + beat
+            for n in chord:
+                events.append((t, 2.0, n))
+    return events
+
 def swing_drums():
     events = []
     for bar in range(BARS):
         for beat in range(BEATS_PER_BAR):
             t = bar*BEATS_PER_BAR + beat
-            # Ride (51)
             if beat in [0,1,2,3]:
                 dur = 0.5 if beat%2==0 else 0.25
-                events.append((t, dur, 51))
+                events.append((t, dur, 51))  # ride
             if beat in [1,3]:
                 events.append((t, 0.25, 36))  # bombo
                 events.append((t, 0.25, 38))  # caja
@@ -136,7 +153,7 @@ def events_to_midi(melody_ev, bass_ev, chord_ev, drum_ev, bpm, instr_melody):
     return mid
 
 # =========================
-# PARTITURA PNG (melodía)
+# PARTITURA PNG
 # =========================
 def draw_score(events, key_name, bpm):
     width, height = 1000, 220
@@ -170,14 +187,15 @@ with col2:
 with col3:
     seed = st.number_input("Semilla",0,99999,42)
 
-mel_instr_name = st.radio("Instrumento de la melodía", list(INSTRUMENTS.keys()))
+mel_instr_name = st.radio("Instrumento de la melodía", list(INSTRUMENTS.keys()), index=0)
 instr_melody = INSTRUMENTS[mel_instr_name]
 
 if st.button("🎶 Generar combo de jazz (MIDI + Partitura)"):
     cfg = KEY_OPTIONS[key_name]
+    prog = build_progression(cfg["root_midi"], cfg["mode"])
     mel = melody(cfg["root_midi"], cfg["mode"], seed)
-    bass = walking_bass(cfg["root_midi"], cfg["mode"])
-    chords_ev = chords(cfg["root_midi"], cfg["mode"])
+    bass = walking_bass(prog)
+    chords_ev = chord_hits(prog)
     drums = swing_drums()
 
     mid = events_to_midi(mel, bass, chords_ev, drums, bpm, instr_melody)
@@ -187,6 +205,6 @@ if st.button("🎶 Generar combo de jazz (MIDI + Partitura)"):
     img = draw_score(mel, key_name, bpm)
     buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
 
-    st.success("¡Listo! Aquí tienes tu combo de jazz 🎷🥁🎶")
+    st.success("¡Listo! Combo de jazz con progresión I–vi–ii–V 🎷🥁🎶")
     st.image(buf, caption="Partitura simplificada de la melodía")
     st.download_button("⬇️ MIDI", data=midi_bytes, file_name="combo.mid")
