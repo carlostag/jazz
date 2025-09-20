@@ -1,25 +1,18 @@
-import io, random, os
-import numpy as np
+import io, random
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from mido import Message, MidiFile, MidiTrack, MetaMessage, bpm2tempo
-from midi2audio import FluidSynth
-from scipy.io import wavfile
 
 # =========================
 # CONFIG
 # =========================
 st.set_page_config(page_title="Generador Jazz Combo", page_icon="🎷")
-st.title("🎷 Generador de Combo de Jazz (melodía, bajo, acordes, batería)")
+st.title("🎷 Generador de Combo de Jazz (MIDI + Partitura)")
 
-SR = 44100
 TICKS_PER_BEAT = 480
 BEATS_PER_BAR = 4
 BARS = 8
 TOTAL_BEATS = BEATS_PER_BAR * BARS
-
-# Ruta del SoundFont (ajústalo a tu entorno)
-SOUNDFONT_PATH = "FluidR3Mono_GM.sf2"
 
 # Escalas diatónicas
 MAJOR_STEPS = [0, 2, 4, 5, 7, 9, 11]
@@ -30,7 +23,6 @@ KEY_OPTIONS = {
     "La menor (A minor)": {"root_midi": 57, "mode": "minor"},
 }
 
-# Instrumentos GM
 INSTRUMENTS = {
     "Vibráfono": 11,
     "Trompeta": 56,
@@ -48,7 +40,6 @@ def degree_to_midi(root_midi, degree, mode):
     return root_midi + diatonic
 
 def walking_bass(root_midi, mode):
-    """Notas negras (1 por pulso), 8 compases."""
     notes = []
     deg = 0
     for bar in range(BARS):
@@ -64,7 +55,6 @@ def walking_bass(root_midi, mode):
     return notes
 
 def chords(root_midi, mode):
-    """Acordes sencillos en 1er y 3er pulso."""
     chords = []
     for bar in range(BARS):
         for beat in [0, 2]:
@@ -76,7 +66,6 @@ def chords(root_midi, mode):
     return chords
 
 def melody(root_midi, mode, seed):
-    """Melodía diatónica sencilla, 8 compases."""
     random.seed(seed)
     deg = 7
     events = []
@@ -92,41 +81,35 @@ def melody(root_midi, mode, seed):
     return events
 
 def swing_drums():
-    """Patrón de ride y bombo/caja simple."""
     events = []
     for bar in range(BARS):
         for beat in range(BEATS_PER_BAR):
             t = bar*BEATS_PER_BAR + beat
-            # Ride (nota 51)
+            # Ride (51)
             if beat in [0,1,2,3]:
                 dur = 0.5 if beat%2==0 else 0.25
                 events.append((t, dur, 51))
-            # Bombo (36) y caja (38) en 2 y 4
             if beat in [1,3]:
-                events.append((t, 0.25, 36))
-                events.append((t, 0.25, 38))
+                events.append((t, 0.25, 36))  # bombo
+                events.append((t, 0.25, 38))  # caja
     return events
 
 # =========================
-# MIDI CONSTRUCCIÓN
+# MIDI GENERATOR
 # =========================
 def events_to_midi(melody_ev, bass_ev, chord_ev, drum_ev, bpm, instr_melody):
     mid = MidiFile(ticks_per_beat=TICKS_PER_BEAT)
 
-    # Melody
     mel_track = MidiTrack(); mid.tracks.append(mel_track)
     mel_track.append(MetaMessage('set_tempo', tempo=bpm2tempo(bpm)))
     mel_track.append(Message('program_change', program=instr_melody, channel=0, time=0))
 
-    # Bass
     bass_track = MidiTrack(); mid.tracks.append(bass_track)
     bass_track.append(Message('program_change', program=32, channel=1, time=0))
 
-    # Chords
     chord_track = MidiTrack(); mid.tracks.append(chord_track)
     chord_track.append(Message('program_change', program=0, channel=2, time=0))
 
-    # Drums
     drum_track = MidiTrack(); mid.tracks.append(drum_track)
 
     def add_events(track, events, channel):
@@ -153,26 +136,7 @@ def events_to_midi(melody_ev, bass_ev, chord_ev, drum_ev, bpm, instr_melody):
     return mid
 
 # =========================
-# RENDER A WAV (midi2audio)
-# =========================
-def midi_to_wav_bytes(midi_obj, sf_path):
-    midi_bytes = io.BytesIO()
-    midi_obj.save(file=midi_bytes)
-    midi_bytes.seek(0)
-    with open("temp.mid","wb") as f:
-        f.write(midi_bytes.read())
-
-    fs = FluidSynth(sf_path)
-    fs.midi_to_audio("temp.mid", "temp.wav")
-
-    with open("temp.wav","rb") as f:
-        wav_data = f.read()
-
-    os.remove("temp.mid"); os.remove("temp.wav")
-    return wav_data
-
-# =========================
-# PARTITURA SIMPLE
+# PARTITURA PNG (melodía)
 # =========================
 def draw_score(events, key_name, bpm):
     width, height = 1000, 220
@@ -209,7 +173,7 @@ with col3:
 mel_instr_name = st.radio("Instrumento de la melodía", list(INSTRUMENTS.keys()))
 instr_melody = INSTRUMENTS[mel_instr_name]
 
-if st.button("🎶 Generar combo de jazz"):
+if st.button("🎶 Generar combo de jazz (MIDI + Partitura)"):
     cfg = KEY_OPTIONS[key_name]
     mel = melody(cfg["root_midi"], cfg["mode"], seed)
     bass = walking_bass(cfg["root_midi"], cfg["mode"])
@@ -218,19 +182,11 @@ if st.button("🎶 Generar combo de jazz"):
 
     mid = events_to_midi(mel, bass, chords_ev, drums, bpm, instr_melody)
 
-    # MIDI en memoria
     midi_bytes = io.BytesIO(); mid.save(file=midi_bytes); midi_bytes.seek(0)
 
-    # WAV renderizado
-    wav_data = midi_to_wav_bytes(mid, SOUNDFONT_PATH)
-    wav_bytes = io.BytesIO(wav_data)
-
-    # Partitura
     img = draw_score(mel, key_name, bpm)
     buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
 
     st.success("¡Listo! Aquí tienes tu combo de jazz 🎷🥁🎶")
     st.image(buf, caption="Partitura simplificada de la melodía")
-    st.audio(wav_bytes, format="audio/wav")
     st.download_button("⬇️ MIDI", data=midi_bytes, file_name="combo.mid")
-    st.download_button("⬇️ WAV", data=wav_bytes, file_name="combo.wav")
