@@ -1,8 +1,7 @@
-import io, random
+import io, random, math
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from mido import Message, MidiFile, MidiTrack, MetaMessage, bpm2tempo
-# music21 está importado por compatibilidad futura (PDF/MusicXML si luego lo usas)
 from music21 import stream as m21stream, note as m21note, chord as m21chord
 from music21 import instrument as m21inst, meter as m21meter, tempo as m21tempo
 from music21 import key as m21key, duration as m21duration, metadata as m21metadata
@@ -11,10 +10,11 @@ from music21 import key as m21key, duration as m21duration, metadata as m21metad
 # CONFIG
 # =========================
 st.set_page_config(page_title="Generador Jazz Combo", page_icon="🎷")
-st.title("🎷 Generador de Combo de Jazz (MIDI + Partitura)")
+st.title("🎷 Generador de Combo de Jazz (MIDI + Visual)")
 
 TICKS_PER_BEAT = 480
 BEATS_PER_BAR = 4
+TARGET_DURATION = 60  # segundos
 
 KEY_OPTIONS = {
     "Do mayor (C major)": {"root_midi": 60, "mode": "major", "tonic": "C", "scale_mode": "major"},
@@ -53,30 +53,29 @@ def clamp_to_range(midi, lo=60, hi=84):
 # =========================
 def build_progression(root_midi, mode, progression_type="I-vi-ii-V"):
     if progression_type == "I-vi-ii-V":
-        bars = 8
-        if mode == "major":
-            four = [
-                [root_midi, root_midi+4, root_midi+7, root_midi+11],       # Cmaj7
-                [root_midi+9, root_midi+12, root_midi+16, root_midi+19],   # Am7
-                [root_midi+2, root_midi+5, root_midi+9, root_midi+12],     # Dm7
-                [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # G7
-            ]
-        else:
-            four = [
-                [root_midi, root_midi+3, root_midi+7, root_midi+10],       # Am7
-                [root_midi+8, root_midi+12, root_midi+15, root_midi+19],   # Fmaj7
-                [root_midi+2, root_midi+5, root_midi+10, root_midi+14],    # Bm7b5
-                [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # E7
-            ]
-        return four * 2, bars
-
+        base = [
+            [root_midi, root_midi+4, root_midi+7, root_midi+11],       # Cmaj7
+            [root_midi+9, root_midi+12, root_midi+16, root_midi+19],   # Am7
+            [root_midi+2, root_midi+5, root_midi+9, root_midi+12],     # Dm7
+            [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # G7
+        ] if mode == "major" else [
+            [root_midi, root_midi+3, root_midi+7, root_midi+10],       # Am7
+            [root_midi+8, root_midi+12, root_midi+15, root_midi+19],   # Fmaj7
+            [root_midi+2, root_midi+5, root_midi+10, root_midi+14],    # Bm7b5
+            [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # E7
+        ]
+        return base
     elif progression_type == "Blues en C":
-        bars = 12
         I7  = [root_midi, root_midi+4, root_midi+7, root_midi+10]
         IV7 = [root_midi+5, root_midi+9, root_midi+12, root_midi+15]
         V7  = [root_midi+7, root_midi+11, root_midi+14, root_midi+17]
-        prog = [I7, I7, I7, I7, IV7, IV7, I7, I7, V7, IV7, I7, V7]
-        return prog, bars
+        return [I7, I7, I7, I7, IV7, IV7, I7, I7, V7, IV7, I7, V7]
+
+def extend_to_duration(prog, bpm):
+    bar_len = (BEATS_PER_BAR * 60.0) / bpm  # duración compás
+    bars_needed = int(round(TARGET_DURATION / bar_len))
+    prog_extended = (prog * ((bars_needed // len(prog)) + 1))[:bars_needed]
+    return prog_extended, bars_needed
 
 # =========================
 # GENERADORES
@@ -92,7 +91,7 @@ def melody(root_midi, mode, seed, total_bars):
         step = random.choice([-2, -1, 1, 2])
         deg += step
         midi = degree_to_midi(root_midi, deg, mode)
-        midi = clamp_to_range(midi, 60, 84)  # vibrafono rango cómodo
+        midi = clamp_to_range(midi, 60, 84)
         if t + dur > TOTAL_BEATS:
             dur = TOTAL_BEATS - t
         events.append((t, dur, midi))
@@ -135,17 +134,13 @@ def swing_drums(total_bars):
 # =========================
 def events_to_midi(melody_ev, bass_ev, chord_ev, drum_ev, bpm, instr_melody):
     mid = MidiFile(ticks_per_beat=TICKS_PER_BEAT)
-
     mel_track = MidiTrack(); mid.tracks.append(mel_track)
     mel_track.append(MetaMessage('set_tempo', tempo=bpm2tempo(bpm)))
     mel_track.append(Message('program_change', program=instr_melody, channel=0, time=0))
-
     bass_track = MidiTrack(); mid.tracks.append(bass_track)
     bass_track.append(Message('program_change', program=32, channel=1, time=0))
-
     chord_track = MidiTrack(); mid.tracks.append(chord_track)
     chord_track.append(Message('program_change', program=0, channel=2, time=0))
-
     drum_track = MidiTrack(); mid.tracks.append(drum_track)
 
     def add_events(track, events, channel):
@@ -168,31 +163,30 @@ def events_to_midi(melody_ev, bass_ev, chord_ev, drum_ev, bpm, instr_melody):
     add_events(bass_track, bass_ev, 1)
     add_events(chord_track, chord_ev, 2)
     add_events(drum_track, drum_ev, 9)
-
     return mid
 
 # =========================
-# PARTITURA SIMPLIFICADA PNG (opcional)
+# VISUAL RANDOM (polígonos o fractales)
 # =========================
-def draw_score_preview(events, key_name, bpm):
-    width, height = 1000, 220
-    img = Image.new("RGB", (width, height), (255, 255, 255))
+def random_polygon_image(width=800, height=600, n_sides=5):
+    img = Image.new("RGB", (width, height), (255,255,255))
     d = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 20)
-    except:
-        font = None
-    d.text((40, 10), f"Melodía ({key_name}, {bpm} bpm)", fill=(0, 0, 0), font=font)
-    y_staff = 120
-    sp = 12
-    for i in range(5):
-        y = y_staff + i * sp
-        d.line([(40, y), (width - 40, y)], fill=(0, 0, 0))
-    x = 60
-    for t, dur, m in events[:32]:
-        y = y_staff + 2 * sp - (m - 60) * 0.5 * sp
-        d.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(0, 0, 0))
-        x += 20
+    pts = [(random.randint(50, width-50), random.randint(50, height-50)) for _ in range(n_sides)]
+    d.polygon(pts, fill=(random.randint(0,255), random.randint(0,255), random.randint(0,255)))
+    return img
+
+def fractal_tree(draw, x, y, angle, depth, length):
+    if depth == 0: return
+    x2 = x + int(math.cos(math.radians(angle)) * length)
+    y2 = y - int(math.sin(math.radians(angle)) * length)
+    draw.line((x, y, x2, y2), fill=(0,0,0), width=2)
+    fractal_tree(draw, x2, y2, angle-20, depth-1, length*0.7)
+    fractal_tree(draw, x2, y2, angle+20, depth-1, length*0.7)
+
+def fractal_image(width=800, height=600):
+    img = Image.new("RGB", (width,height), (255,255,255))
+    d = ImageDraw.Draw(img)
+    fractal_tree(d, width//2, height-50, -90, 8, 80)
     return img
 
 # =========================
@@ -210,15 +204,13 @@ progression_type = st.radio("Tipo de progresión", ["I-vi-ii-V", "Blues en C"], 
 mel_instr_name = st.radio("Instrumento de la melodía (MIDI)", list(INSTRUMENTS.keys()), index=0, key="radio_instr")
 instr_melody = INSTRUMENTS[mel_instr_name]
 
-# Opción de imagen estática
-use_static = st.checkbox("Usar imagen estática en lugar del pentagrama", value=False, key="chk_static")
-static_img_file = None
-if use_static:
-    static_img_file = st.file_uploader("Sube una imagen (PNG/JPG)", type=["png", "jpg", "jpeg"], key="upl_img")
+visual_type = st.radio("Visual", ["Pentagrama simplificado", "Polígono aleatorio", "Fractal"], key="radio_visual")
 
-if st.button("🎶 Generar combo de jazz (MIDI + Visual)", key="btn_generate"):
+if st.button("🎶 Generar combo de jazz (60s)", key="btn_generate"):
     cfg = KEY_OPTIONS[key_name]
-    prog, total_bars = build_progression(cfg["root_midi"], cfg["mode"], progression_type)
+    prog_base = build_progression(cfg["root_midi"], cfg["mode"], progression_type)
+    prog, total_bars = extend_to_duration(prog_base, bpm)
+
     mel = melody(cfg["root_midi"], cfg["mode"], seed, total_bars)
     bass = walking_bass(prog)
     chords_ev = chord_hits(prog)
@@ -228,13 +220,24 @@ if st.button("🎶 Generar combo de jazz (MIDI + Visual)", key="btn_generate"):
     midi_bytes = io.BytesIO()
     mid.save(file=midi_bytes); midi_bytes.seek(0)
 
-    # Visual: imagen estática o partitura simplificada
-    if use_static and static_img_file is not None:
-        st.image(static_img_file, caption="Imagen estática")
+    if visual_type == "Pentagrama simplificado":
+        img = Image.new("RGB", (1000,220), (255,255,255))
+        d = ImageDraw.Draw(img)
+        d.text((40,10), f"Melodía ({key_name}, {bpm} bpm)", fill=(0,0,0))
+        for i in range(5):
+            y = 120+i*12; d.line([(40,y),(960,y)], fill=(0,0,0))
+        x=60
+        for t,dur,m in mel[:32]:
+            y = 120+24-(m-60)*6
+            d.ellipse([x-5,y-5,x+5,y+5], fill=(0,0,0))
+            x+=20
+    elif visual_type == "Polígono aleatorio":
+        img = random_polygon_image()
     else:
-        preview_img = draw_score_preview(mel, key_name, bpm)
-        buf = io.BytesIO(); preview_img.save(buf, format="PNG"); buf.seek(0)
-        st.image(buf, caption="Vista previa rápida (melodía)")
+        img = fractal_image()
 
-    st.success(f"¡Listo! 🎷 Combo con progresión {progression_type}.")
+    buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
+
+    st.success(f"¡Listo! 🎷 Combo de {total_bars} compases ≈ {TARGET_DURATION}s")
+    st.image(buf, caption="Visual generado")
     st.download_button("⬇️ Descargar MIDI", data=midi_bytes, file_name="combo.mid", mime="audio/midi")
