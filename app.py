@@ -1,444 +1,240 @@
-import os, math, random
-import numpy as np
+import io, random
 import streamlit as st
-from tempfile import NamedTemporaryFile
-from PIL import Image, ImageDraw
-from scipy.io import wavfile
-from moviepy.editor import VideoClip, AudioFileClip
+from PIL import Image, ImageDraw, ImageFont
+from mido import Message, MidiFile, MidiTrack, MetaMessage, bpm2tempo
+# music21 está importado por compatibilidad futura (PDF/MusicXML si luego lo usas)
+from music21 import stream as m21stream, note as m21note, chord as m21chord
+from music21 import instrument as m21inst, meter as m21meter, tempo as m21tempo
+from music21 import key as m21key, duration as m21duration, metadata as m21metadata
 
 # =========================
 # CONFIG
 # =========================
-DURATION_SEC = 60
-SR = 44100
-W, H = 1080, 1920
-FPS = 30
-KEY_LOW, KEY_HIGH = 48, 76
+st.set_page_config(page_title="Generador Jazz Combo", page_icon="🎷")
+st.title("🎷 Generador de Combo de Jazz (MIDI + Partitura)")
 
-NOTE_TO_SEMITONE = {"C":0,"C#":1,"Db":1,"D":2,"D#":3,"Eb":3,"E":4,"F":5,
-    "F#":6,"Gb":6,"G":7,"G#":8,"Ab":8,"A":9,"A#":10,"Bb":10,"B":11}
+TICKS_PER_BEAT = 480
+BEATS_PER_BAR = 4
 
-PC_COLORS = {
-    0:(255,140,140), 1:(255,170,120), 2:(255,200,120), 3:(240,220,120),
-    4:(200,240,130), 5:(150,250,160), 6:(140,230,220), 7:(140,190,255),
-    8:(170,160,255), 9:(210,150,255),10:(240,140,220),11:(255,140,180)
+KEY_OPTIONS = {
+    "Do mayor (C major)": {"root_midi": 60, "mode": "major", "tonic": "C", "scale_mode": "major"},
+    "La menor (A minor)": {"root_midi": 57, "mode": "minor", "tonic": "A", "scale_mode": "minor"},
 }
 
-# =========================
-# UTILIDADES
-# =========================
-def midi_from_note(note_name, octave=4):
-    return 12*(octave+1)+NOTE_TO_SEMITONE[note_name]
-
-def freq_from_midi(m):
-    return 440.0*(2.0**((m-69)/12.0))
-
-def clamp_vis_to_range(m, low=KEY_LOW, high=KEY_HIGH):
-    while m < low:  m += 12
-    while m > high: m -= 12
-    return m
-
-def adsr_envelope(n_samples, sr, attack=0.01, decay=0.2, sustain=0.5, release=0.2):
-    a = int(attack*sr); d = int(decay*sr); r = int(release*sr)
-    total = a+d+r
-    if total > n_samples:
-        factor = n_samples/total
-        a = max(1,int(a*factor)); d = max(1,int(d*factor)); r = max(1,int(r*factor))
-    s = max(n_samples-(a+d+r),0)
-    env = np.zeros(n_samples,dtype=np.float32)
-    if a>0: env[:a]=np.linspace(0,1,a,endpoint=False)
-    if d>0: env[a:a+d]=np.linspace(1,sustain,d,endpoint=False)
-    if s>0: env[a+d:a+d+s]=sustain
-    if r>0: env[a+d+s:a+d+s+r]=np.linspace(sustain,0,r,endpoint=True)
-    return env
-
-def apply_fades(y,sr,ms=3):
-    n=len(y); f=max(1,int((ms/1000.0)*sr))
-    if f*2>=n: f=n//4 if n>=4 else 1
-    if f>1:
-        win=0.5-0.5*np.cos(np.linspace(0,math.pi,f))
-        y[:f]*=win; y[-f:]*=win[::-1]
-    return y
-
-def mallet_note(freq,dur,sr):
-    n=int(sr*dur); 
-    if n<=0: return np.zeros(0,dtype=np.float32)
-    t=np.linspace(0,dur,n,endpoint=False)
-    nyq=sr/2.0
-    mults=[1,2,3,4]; amps=[1.0,0.35,0.2,0.12]
-    x=np.zeros(n,dtype=np.float32)
-    for m,a in zip(mults,amps):
-        f=freq*m
-        if f<nyq: x+=a*np.sin(2*np.pi*f*t)
-    env=adsr_envelope(n,sr,0.008,0.18,0.45,0.18)
-    y=apply_fades(x*env,sr,3)
-    return y
-
-def bass_sine(freq,dur,sr):
-    n=int(sr*dur)
-    if n<=0: return np.zeros(0,dtype=np.float32)
-    t=np.linspace(0,dur,n,endpoint=False)
-    x=np.sin(2*np.pi*freq*t).astype(np.float32)
-    env=adsr_envelope(n,sr,0.005,0.12,0.65,0.12)
-    return apply_fades(x*env,sr,3)
-
-# =========================
-# PROGRESIONES ALEATORIAS
-# =========================
-def random_progression(root="C"):
-    progs = [
-        [("I","maj"),("vi","min"),("ii","min"),("V","maj")],
-        [("I","maj"),("IV","maj"),("I","maj"),("V","maj")],
-        [("ii","min"),("V","maj"),("I","maj"),("I","maj")],
-    ]
-    return random.choice(progs)
-
-def chord_root_from_degree(root_midi, degree):
-    steps={"I":0,"ii":2,"iii":4,"IV":5,"V":7,"vi":9}
-    return root_midi+steps[degree]
-
-def chord_voicing_simple(midi_root, quality):
-    return [midi_root, midi_root+(4 if quality=="maj" else 3), midi_root+7]
-
-# =========================
-# GENERADOR MUSICAL
-# =========================
-def generate_track(duration_s, sr, bpm, root="C"):
-    q=60.0/bpm; beats_per_bar=4
-    total_bars=int(duration_s/(beats_per_bar*q))
-    root_midi=midi_from_note(root,4)
-    prog=random_progression(root)
-    audio=np.zeros(int(sr*duration_s),dtype=np.float32)
-    notes=[]
-    last_mel=None
-
-    for bar in range(total_bars):
-        deg,quality=prog[bar%len(prog)]
-        chord_root=chord_root_from_degree(root_midi,deg)
-        t_bar=bar*beats_per_bar*q
-        last_bar=(bar==total_bars-1)
-
-        # acordes
-        dur_ch=beats_per_bar*q
-        for m in chord_voicing_simple(chord_root,quality):
-            y=0.2*mallet_note(freq_from_midi(m),dur_ch,sr)
-            s=int(t_bar*sr); e=s+len(y)
-            audio[s:e]+=y; notes.append((t_bar,dur_ch,m,"chord"))
-
-        # bajo
-        if not last_bar:
-            f=freq_from_midi(chord_root-24)
-            y=0.3*bass_sine(f,dur_ch,sr)
-            s=int(t_bar*sr); e=s+len(y)
-            audio[s:e]+=y; notes.append((t_bar,dur_ch,chord_root-24,"bass"))
-
-        # melodía
-        if not last_bar:
-            scale=[chord_root,chord_root+2,chord_root+4,chord_root+7]
-            sub=0.0
-            while sub<beats_per_bar:
-                if random.random()<0.8:
-                    m=random.choice(scale)
-                    dur_b=random.choice([0.5,1.0])
-                    if sub+dur_b>beats_per_bar: dur_b=beats_per_bar-sub
-                    t_mel=t_bar+sub*q
-                    y=0.4*mallet_note(freq_from_midi(m),dur_b*q,sr)
-                    s=int(t_mel*sr); e=s+len(y)
-                    audio[s:e]+=y; notes.append((t_mel,dur_b*q,m,"mel"))
-                    sub+=dur_b
-                else:
-                    sub+=0.5
-    audio/=np.max(np.abs(audio)+1e-12)
-    return audio,notes
-
-# =========================
-# VISUAL
-# =========================
-def make_frame_factory(notes,duration,bpm):
-    q=60.0/bpm; beats_per_bar=4; bar_time=beats_per_bar*q
-    keys=list(range(KEY_LOW,KEY_HIGH+1))
-    key_w=max(4,W//len(keys))
-    roll_top=int(H*0.1); kb_top=int(H*0.75)
-    roll_h=kb_top-roll_top; lead_time=3.0
-    speed=roll_h/lead_time
-    def make_frame(t):
-        img=Image.new("RGB",(W,H),(10,10,20))
-        draw=ImageDraw.Draw(img)
-        # compases
-        for bar in range(int(duration//bar_time)+1):
-            t_bar=bar*bar_time; dt=t_bar-t
-            if -bar_time<=dt<=lead_time:
-                y_line=kb_top-int(max(0,dt)*speed)
-                draw.line([(0,y_line),(W,y_line)],fill=(200,200,200),width=2)
-        # teclado
-        for i,m in enumerate(keys):
-            x0,x1=i*key_w,(i+1)*key_w
-            col=(50,50,50) if m%12 in [1,3,6,8,10] else (230,230,230)
-            draw.rectangle([x0,kb_top,x1,H],fill=col)
-        # notas
-        for role_order in ["chord","bass","mel"]:
-            for t0,d,m,role in notes:
-                if role!=role_order: continue
-                m_vis=clamp_vis_to_range(m)
-                if m_vis not in keys: continue
-                dt=t0-t
-                if -d<=dt<=lead_time:
-                    yb=kb_top-int(max(0,dt)*speed)
-                    ht=max(8 if role=="chord" else 20,int(d*speed))
-                    yt=yb-ht
-                    idx=keys.index(m_vis)
-                    if role=="chord":
-                        x0=idx*key_w+key_w//3; x1=(idx+1)*key_w-key_w//3; col=(120,160,200)
-                    elif role=="bass":
-                        x0=idx*key_w+key_w//4; x1=(idx+1)*key_w-key_w//4; col=(80,80,200)
-                    else:
-                        x0=idx*key_w+2; x1=(idx+1)*key_w-2; col=PC_COLORS[m%12]
-                    draw.rectangle([x0,yt,x1,yb],fill=col)
-        return np.array(img)
-    return make_frame
-
-# =========================
-# STREAMLIT UI
-# =========================
-st.title("🎷 Generador de Jazz Shorts (60s)")
-bpm=st.slider("BPM",70,130,100)
-root=st.selectbox("Tonalidad",["C","D","E","F","G","A","Bb"])
-if st.button("🎬 Generar vídeo aleatorio"):
-    y,notes=generate_track(DURATION_SEC,SR,bpm,root)
-    with NamedTemporaryFile(delete=False,suffix=".wav") as tmp:
-        wav= np.int16(np.clip(y,-1.0,1.0)*32767)
-        wavfile.write(tmp.name,SR,wav)
-        audio_path=tmp.name
-    make_frame=make_frame_factory(notes,DURATION_SEC,bpm)
-    clip=VideoClip(make_frame,duration=DURATION_SEC).set_fps(FPS)
-    audio=AudioFileClip(audio_path)
-    clip=clip.set_audio(audio)
-    out="jazz_short.mp4"
-    clip.write_videofile(out,codec="libx264",audio_codec="aac",fps=FPS)
-    st.video(out)
-    os.remove(audio_path)
-import os, math, random
-import numpy as np
-import streamlit as st
-from tempfile import NamedTemporaryFile
-from PIL import Image, ImageDraw
-from scipy.io import wavfile
-from moviepy.editor import VideoClip, AudioFileClip
-
-# =========================
-# CONFIG
-# =========================
-DURATION_SEC = 60
-SR = 44100
-W, H = 1080, 1920
-FPS = 30
-KEY_LOW, KEY_HIGH = 48, 76
-
-NOTE_TO_SEMITONE = {"C":0,"C#":1,"Db":1,"D":2,"D#":3,"Eb":3,"E":4,"F":5,
-    "F#":6,"Gb":6,"G":7,"G#":8,"Ab":8,"A":9,"A#":10,"Bb":10,"B":11}
-
-PC_COLORS = {
-    0:(255,140,140), 1:(255,170,120), 2:(255,200,120), 3:(240,220,120),
-    4:(200,240,130), 5:(150,250,160), 6:(140,230,220), 7:(140,190,255),
-    8:(170,160,255), 9:(210,150,255),10:(240,140,220),11:(255,140,180)
+INSTRUMENTS = {
+    "Vibráfono": 11,
+    "Trompeta": 56,
 }
 
-# =========================
-# UTILIDADES
-# =========================
-def midi_from_note(note_name, octave=4):
-    return 12*(octave+1)+NOTE_TO_SEMITONE[note_name]
-
-def freq_from_midi(m):
-    return 440.0*(2.0**((m-69)/12.0))
-
-def clamp_vis_to_range(m, low=KEY_LOW, high=KEY_HIGH):
-    while m < low:  m += 12
-    while m > high: m -= 12
-    return m
-
-def adsr_envelope(n_samples, sr, attack=0.01, decay=0.2, sustain=0.5, release=0.2):
-    a = int(attack*sr); d = int(decay*sr); r = int(release*sr)
-    total = a+d+r
-    if total > n_samples:
-        factor = n_samples/total
-        a = max(1,int(a*factor)); d = max(1,int(d*factor)); r = max(1,int(r*factor))
-    s = max(n_samples-(a+d+r),0)
-    env = np.zeros(n_samples,dtype=np.float32)
-    if a>0: env[:a]=np.linspace(0,1,a,endpoint=False)
-    if d>0: env[a:a+d]=np.linspace(1,sustain,d,endpoint=False)
-    if s>0: env[a+d:a+d+s]=sustain
-    if r>0: env[a+d+s:a+d+s+r]=np.linspace(sustain,0,r,endpoint=True)
-    return env
-
-def apply_fades(y,sr,ms=3):
-    n=len(y); f=max(1,int((ms/1000.0)*sr))
-    if f*2>=n: f=n//4 if n>=4 else 1
-    if f>1:
-        win=0.5-0.5*np.cos(np.linspace(0,math.pi,f))
-        y[:f]*=win; y[-f:]*=win[::-1]
-    return y
-
-def mallet_note(freq,dur,sr):
-    n=int(sr*dur); 
-    if n<=0: return np.zeros(0,dtype=np.float32)
-    t=np.linspace(0,dur,n,endpoint=False)
-    nyq=sr/2.0
-    mults=[1,2,3,4]; amps=[1.0,0.35,0.2,0.12]
-    x=np.zeros(n,dtype=np.float32)
-    for m,a in zip(mults,amps):
-        f=freq*m
-        if f<nyq: x+=a*np.sin(2*np.pi*f*t)
-    env=adsr_envelope(n,sr,0.008,0.18,0.45,0.18)
-    y=apply_fades(x*env,sr,3)
-    return y
-
-def bass_sine(freq,dur,sr):
-    n=int(sr*dur)
-    if n<=0: return np.zeros(0,dtype=np.float32)
-    t=np.linspace(0,dur,n,endpoint=False)
-    x=np.sin(2*np.pi*freq*t).astype(np.float32)
-    env=adsr_envelope(n,sr,0.005,0.12,0.65,0.12)
-    return apply_fades(x*env,sr,3)
+# Escalas diatónicas
+MAJOR_STEPS = [0, 2, 4, 5, 7, 9, 11]
+MINOR_STEPS = [0, 2, 3, 5, 7, 8, 10]
 
 # =========================
-# PROGRESIONES ALEATORIAS
+# UTILIDADES MUSICALES
 # =========================
-def random_progression(root="C"):
-    progs = [
-        [("I","maj"),("vi","min"),("ii","min"),("V","maj")],
-        [("I","maj"),("IV","maj"),("I","maj"),("V","maj")],
-        [("ii","min"),("V","maj"),("I","maj"),("I","maj")],
-    ]
-    return random.choice(progs)
+def scale_steps(mode):
+    return MAJOR_STEPS if mode == "major" else MINOR_STEPS
 
-def chord_root_from_degree(root_midi, degree):
-    steps={"I":0,"ii":2,"iii":4,"IV":5,"V":7,"vi":9}
-    return root_midi+steps[degree]
+def degree_to_midi(root_midi, degree, mode):
+    steps = scale_steps(mode)
+    diatonic = steps[degree % 7] + 12 * (degree // 7)
+    return root_midi + diatonic
 
-def chord_voicing_simple(midi_root, quality):
-    return [midi_root, midi_root+(4 if quality=="maj" else 3), midi_root+7]
+def clamp_to_range(midi, lo=60, hi=84):
+    while midi < lo:
+        midi += 12
+    while midi > hi:
+        midi -= 12
+    return midi
 
 # =========================
-# GENERADOR MUSICAL
+# PROGRESIONES
 # =========================
-def generate_track(duration_s, sr, bpm, root="C"):
-    q=60.0/bpm; beats_per_bar=4
-    total_bars=int(duration_s/(beats_per_bar*q))
-    root_midi=midi_from_note(root,4)
-    prog=random_progression(root)
-    audio=np.zeros(int(sr*duration_s),dtype=np.float32)
-    notes=[]
-    last_mel=None
+def build_progression(root_midi, mode, progression_type="I-vi-ii-V"):
+    if progression_type == "I-vi-ii-V":
+        bars = 8
+        if mode == "major":
+            four = [
+                [root_midi, root_midi+4, root_midi+7, root_midi+11],       # Cmaj7
+                [root_midi+9, root_midi+12, root_midi+16, root_midi+19],   # Am7
+                [root_midi+2, root_midi+5, root_midi+9, root_midi+12],     # Dm7
+                [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # G7
+            ]
+        else:
+            four = [
+                [root_midi, root_midi+3, root_midi+7, root_midi+10],       # Am7
+                [root_midi+8, root_midi+12, root_midi+15, root_midi+19],   # Fmaj7
+                [root_midi+2, root_midi+5, root_midi+10, root_midi+14],    # Bm7b5
+                [root_midi+7, root_midi+11, root_midi+14, root_midi+17],   # E7
+            ]
+        return four * 2, bars
 
+    elif progression_type == "Blues en C":
+        bars = 12
+        I7  = [root_midi, root_midi+4, root_midi+7, root_midi+10]
+        IV7 = [root_midi+5, root_midi+9, root_midi+12, root_midi+15]
+        V7  = [root_midi+7, root_midi+11, root_midi+14, root_midi+17]
+        prog = [I7, I7, I7, I7, IV7, IV7, I7, I7, V7, IV7, I7, V7]
+        return prog, bars
+
+# =========================
+# GENERADORES
+# =========================
+def melody(root_midi, mode, seed, total_bars):
+    random.seed(seed)
+    deg = 7
+    events = []
+    TOTAL_BEATS = total_bars * BEATS_PER_BAR
+    t = 0.0
+    while t < TOTAL_BEATS:
+        dur = random.choice([0.5, 1.0])
+        step = random.choice([-2, -1, 1, 2])
+        deg += step
+        midi = degree_to_midi(root_midi, deg, mode)
+        midi = clamp_to_range(midi, 60, 84)  # vibrafono rango cómodo
+        if t + dur > TOTAL_BEATS:
+            dur = TOTAL_BEATS - t
+        events.append((t, dur, midi))
+        t += dur
+    return events
+
+def walking_bass(prog):
+    events = []
+    for bar, chord in enumerate(prog):
+        root = chord[0] - 24
+        for beat in range(BEATS_PER_BAR):
+            t = bar*BEATS_PER_BAR + beat
+            events.append((t, 1.0, root))
+    return events
+
+def chord_hits(prog):
+    events = []
+    for bar, chord in enumerate(prog):
+        for beat in [0, 2]:
+            t = bar*BEATS_PER_BAR + beat
+            for n in chord:
+                events.append((t, 2.0, n))
+    return events
+
+def swing_drums(total_bars):
+    events = []
     for bar in range(total_bars):
-        deg,quality=prog[bar%len(prog)]
-        chord_root=chord_root_from_degree(root_midi,deg)
-        t_bar=bar*beats_per_bar*q
-        last_bar=(bar==total_bars-1)
-
-        # acordes
-        dur_ch=beats_per_bar*q
-        for m in chord_voicing_simple(chord_root,quality):
-            y=0.2*mallet_note(freq_from_midi(m),dur_ch,sr)
-            s=int(t_bar*sr); e=s+len(y)
-            audio[s:e]+=y; notes.append((t_bar,dur_ch,m,"chord"))
-
-        # bajo
-        if not last_bar:
-            f=freq_from_midi(chord_root-24)
-            y=0.3*bass_sine(f,dur_ch,sr)
-            s=int(t_bar*sr); e=s+len(y)
-            audio[s:e]+=y; notes.append((t_bar,dur_ch,chord_root-24,"bass"))
-
-        # melodía
-        if not last_bar:
-            scale=[chord_root,chord_root+2,chord_root+4,chord_root+7]
-            sub=0.0
-            while sub<beats_per_bar:
-                if random.random()<0.8:
-                    m=random.choice(scale)
-                    dur_b=random.choice([0.5,1.0])
-                    if sub+dur_b>beats_per_bar: dur_b=beats_per_bar-sub
-                    t_mel=t_bar+sub*q
-                    y=0.4*mallet_note(freq_from_midi(m),dur_b*q,sr)
-                    s=int(t_mel*sr); e=s+len(y)
-                    audio[s:e]+=y; notes.append((t_mel,dur_b*q,m,"mel"))
-                    sub+=dur_b
-                else:
-                    sub+=0.5
-    audio/=np.max(np.abs(audio)+1e-12)
-    return audio,notes
+        for beat in range(BEATS_PER_BAR):
+            t = bar*BEATS_PER_BAR + beat
+            if beat in [0,1,2,3]:
+                dur = 0.5 if beat % 2 == 0 else 0.25
+                events.append((t, dur, 51))  # ride
+            if beat in [1,3]:
+                events.append((t, 0.25, 36)) # bombo
+                events.append((t, 0.25, 38)) # caja
+    return events
 
 # =========================
-# VISUAL
+# MIDI BUILDER
 # =========================
-def make_frame_factory(notes,duration,bpm):
-    q=60.0/bpm; beats_per_bar=4; bar_time=beats_per_bar*q
-    keys=list(range(KEY_LOW,KEY_HIGH+1))
-    key_w=max(4,W//len(keys))
-    roll_top=int(H*0.1); kb_top=int(H*0.75)
-    roll_h=kb_top-roll_top; lead_time=3.0
-    speed=roll_h/lead_time
-    def make_frame(t):
-        img=Image.new("RGB",(W,H),(10,10,20))
-        draw=ImageDraw.Draw(img)
-        # compases
-        for bar in range(int(duration//bar_time)+1):
-            t_bar=bar*bar_time; dt=t_bar-t
-            if -bar_time<=dt<=lead_time:
-                y_line=kb_top-int(max(0,dt)*speed)
-                draw.line([(0,y_line),(W,y_line)],fill=(200,200,200),width=2)
-        # teclado
-        for i,m in enumerate(keys):
-            x0,x1=i*key_w,(i+1)*key_w
-            col=(50,50,50) if m%12 in [1,3,6,8,10] else (230,230,230)
-            draw.rectangle([x0,kb_top,x1,H],fill=col)
-        # notas
-        for role_order in ["chord","bass","mel"]:
-            for t0,d,m,role in notes:
-                if role!=role_order: continue
-                m_vis=clamp_vis_to_range(m)
-                if m_vis not in keys: continue
-                dt=t0-t
-                if -d<=dt<=lead_time:
-                    yb=kb_top-int(max(0,dt)*speed)
-                    ht=max(8 if role=="chord" else 20,int(d*speed))
-                    yt=yb-ht
-                    idx=keys.index(m_vis)
-                    if role=="chord":
-                        x0=idx*key_w+key_w//3; x1=(idx+1)*key_w-key_w//3; col=(120,160,200)
-                    elif role=="bass":
-                        x0=idx*key_w+key_w//4; x1=(idx+1)*key_w-key_w//4; col=(80,80,200)
-                    else:
-                        x0=idx*key_w+2; x1=(idx+1)*key_w-2; col=PC_COLORS[m%12]
-                    draw.rectangle([x0,yt,x1,yb],fill=col)
-        return np.array(img)
-    return make_frame
+def events_to_midi(melody_ev, bass_ev, chord_ev, drum_ev, bpm, instr_melody):
+    mid = MidiFile(ticks_per_beat=TICKS_PER_BEAT)
+
+    mel_track = MidiTrack(); mid.tracks.append(mel_track)
+    mel_track.append(MetaMessage('set_tempo', tempo=bpm2tempo(bpm)))
+    mel_track.append(Message('program_change', program=instr_melody, channel=0, time=0))
+
+    bass_track = MidiTrack(); mid.tracks.append(bass_track)
+    bass_track.append(Message('program_change', program=32, channel=1, time=0))
+
+    chord_track = MidiTrack(); mid.tracks.append(chord_track)
+    chord_track.append(Message('program_change', program=0, channel=2, time=0))
+
+    drum_track = MidiTrack(); mid.tracks.append(drum_track)
+
+    def add_events(track, events, channel):
+        evts = []
+        for t, dur, midi in events:
+            on = ('on', int(round(t*TICKS_PER_BEAT)), midi)
+            off = ('off', int(round((t+dur)*TICKS_PER_BEAT)), midi)
+            evts += [on, off]
+        evts.sort(key=lambda x: (x[1], 0 if x[0]=='off' else 1))
+        cursor = 0
+        for typ, tick, midi in evts:
+            delta = tick - cursor
+            cursor = tick
+            if typ == 'on':
+                track.append(Message('note_on', note=int(midi), velocity=90, time=delta, channel=channel))
+            else:
+                track.append(Message('note_off', note=int(midi), velocity=64, time=delta, channel=channel))
+
+    add_events(mel_track, melody_ev, 0)
+    add_events(bass_track, bass_ev, 1)
+    add_events(chord_track, chord_ev, 2)
+    add_events(drum_track, drum_ev, 9)
+
+    return mid
 
 # =========================
-# STREAMLIT UI
+# PARTITURA SIMPLIFICADA PNG (opcional)
 # =========================
-st.title("🎷 Generador de Jazz Shorts (60s)")
+def draw_score_preview(events, key_name, bpm):
+    width, height = 1000, 220
+    img = Image.new("RGB", (width, height), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 20)
+    except:
+        font = None
+    d.text((40, 10), f"Melodía ({key_name}, {bpm} bpm)", fill=(0, 0, 0), font=font)
+    y_staff = 120
+    sp = 12
+    for i in range(5):
+        y = y_staff + i * sp
+        d.line([(40, y), (width - 40, y)], fill=(0, 0, 0))
+    x = 60
+    for t, dur, m in events[:32]:
+        y = y_staff + 2 * sp - (m - 60) * 0.5 * sp
+        d.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(0, 0, 0))
+        x += 20
+    return img
 
-bpm = st.slider("BPM", 70, 130, 100, key="slider_bpm")
-root = st.selectbox("Tonalidad", ["C","D","E","F","G","A","Bb"], key="select_root")
+# =========================
+# UI
+# =========================
+col1, col2, col3 = st.columns(3)
+with col1:
+    key_name = st.selectbox("Tonalidad", list(KEY_OPTIONS.keys()), key="sel_key")
+with col2:
+    bpm = st.slider("BPM", 60, 140, 100, key="slider_bpm")
+with col3:
+    seed = st.number_input("Semilla", 0, 99999, 42, key="num_seed")
 
-if st.button("🎬 Generar vídeo aleatorio", key="btn_generate"):
-    y, notes = generate_track(DURATION_SEC, SR, bpm, root)
-    with NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        wav = np.int16(np.clip(y, -1.0, 1.0) * 32767)
-        wavfile.write(tmp.name, SR, wav)
-        audio_path = tmp.name
+progression_type = st.radio("Tipo de progresión", ["I-vi-ii-V", "Blues en C"], key="radio_prog")
+mel_instr_name = st.radio("Instrumento de la melodía (MIDI)", list(INSTRUMENTS.keys()), index=0, key="radio_instr")
+instr_melody = INSTRUMENTS[mel_instr_name]
 
-    make_frame = make_frame_factory(notes, DURATION_SEC, bpm)
-    clip = VideoClip(make_frame, duration=DURATION_SEC).set_fps(FPS)
-    audio = AudioFileClip(audio_path)
-    clip = clip.set_audio(audio)
+# Opción de imagen estática
+use_static = st.checkbox("Usar imagen estática en lugar del pentagrama", value=False, key="chk_static")
+static_img_file = None
+if use_static:
+    static_img_file = st.file_uploader("Sube una imagen (PNG/JPG)", type=["png", "jpg", "jpeg"], key="upl_img")
 
-    out = "jazz_short.mp4"
-    clip.write_videofile(out, codec="libx264", audio_codec="aac", fps=FPS)
+if st.button("🎶 Generar combo de jazz (MIDI + Visual)", key="btn_generate"):
+    cfg = KEY_OPTIONS[key_name]
+    prog, total_bars = build_progression(cfg["root_midi"], cfg["mode"], progression_type)
+    mel = melody(cfg["root_midi"], cfg["mode"], seed, total_bars)
+    bass = walking_bass(prog)
+    chords_ev = chord_hits(prog)
+    drums = swing_drums(total_bars)
 
-    st.video(out)
-    os.remove(audio_path)
+    mid = events_to_midi(mel, bass, chords_ev, drums, bpm, instr_melody)
+    midi_bytes = io.BytesIO()
+    mid.save(file=midi_bytes); midi_bytes.seek(0)
 
+    # Visual: imagen estática o partitura simplificada
+    if use_static and static_img_file is not None:
+        st.image(static_img_file, caption="Imagen estática")
+    else:
+        preview_img = draw_score_preview(mel, key_name, bpm)
+        buf = io.BytesIO(); preview_img.save(buf, format="PNG"); buf.seek(0)
+        st.image(buf, caption="Vista previa rápida (melodía)")
+
+    st.success(f"¡Listo! 🎷 Combo con progresión {progression_type}.")
+    st.download_button("⬇️ Descargar MIDI", data=midi_bytes, file_name="combo.mid", mime="audio/midi")
