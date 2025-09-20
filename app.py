@@ -420,19 +420,25 @@ def make_frame_factory(notes,duration,bpm):
 # STREAMLIT UI
 # =========================
 st.title("🎷 Generador de Jazz Shorts (60s)")
-bpm=st.slider("BPM",70,130,100)
-root=st.selectbox("Tonalidad",["C","D","E","F","G","A","Bb"])
-if st.button("🎬 Generar vídeo aleatorio"):
-    y,notes=generate_track(DURATION_SEC,SR,bpm,root)
-    with NamedTemporaryFile(delete=False,suffix=".wav") as tmp:
-        wav= np.int16(np.clip(y,-1.0,1.0)*32767)
-        wavfile.write(tmp.name,SR,wav)
-        audio_path=tmp.name
-    make_frame=make_frame_factory(notes,DURATION_SEC,bpm)
-    clip=VideoClip(make_frame,duration=DURATION_SEC).set_fps(FPS)
-    audio=AudioFileClip(audio_path)
-    clip=clip.set_audio(audio)
-    out="jazz_short.mp4"
-    clip.write_videofile(out,codec="libx264",audio_codec="aac",fps=FPS)
+
+bpm = st.slider("BPM", 70, 130, 100, key="slider_bpm")
+root = st.selectbox("Tonalidad", ["C","D","E","F","G","A","Bb"], key="select_root")
+
+if st.button("🎬 Generar vídeo aleatorio", key="btn_generate"):
+    y, notes = generate_track(DURATION_SEC, SR, bpm, root)
+    with NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        wav = np.int16(np.clip(y, -1.0, 1.0) * 32767)
+        wavfile.write(tmp.name, SR, wav)
+        audio_path = tmp.name
+
+    make_frame = make_frame_factory(notes, DURATION_SEC, bpm)
+    clip = VideoClip(make_frame, duration=DURATION_SEC).set_fps(FPS)
+    audio = AudioFileClip(audio_path)
+    clip = clip.set_audio(audio)
+
+    out = "jazz_short.mp4"
+    clip.write_videofile(out, codec="libx264", audio_codec="aac", fps=FPS)
+
     st.video(out)
     os.remove(audio_path)
+
