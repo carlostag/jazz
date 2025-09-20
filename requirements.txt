@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+pillow
+scipy
+moviepy
+mido
+langchain_groq
